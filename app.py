@@ -103,6 +103,16 @@ except Exception as e:
 
 logger = logging.getLogger(__name__)
 
+# ========= DEPLOYMENT-SAFETY GUARD =========
+# Refuse to start when the operator has bound the app to a non-loopback
+# interface with auth disabled or LOCALHOST_BYPASS on. Catches the
+# common foot-gun of "expose to LAN with AUTH_ENABLED=false for testing"
+# before the app even constructs. See core/security_guards.py for the
+# full rationale and the override escape hatch
+# (ODYSSEUS_ALLOW_INSECURE_DEPLOY=1).
+from core.security_guards import check_deployment_safety
+check_deployment_safety()
+
 # ========= APP =========
 # Lifespan is defined below (after all helpers it references are in scope)
 # and passed to FastAPI so we can use the modern context-manager lifecycle
