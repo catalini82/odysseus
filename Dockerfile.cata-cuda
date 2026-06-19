@@ -1,0 +1,98 @@
+# Dockerfile.cata-cuda — Odysseus image with CUDA build tooling for Cookbook.
+# PATCH-002: Adds nvcc + CUDA runtime so Cookbook can build llama.cpp with
+# GGML_CUDA=ON and serve local GGUF models on the RTX 4090.
+#
+# Why this file exists:
+#   The upstream Dockerfile uses python:3.14-slim which has no CUDA tooling.
+#   pip CUDA wheels (nvidia-cuda-nvcc-cu12) only ship ptxas + headers, NOT
+#   the nvcc compiler binary. CMake requires nvcc to configure GGML_CUDA=ON.
+#   This Dockerfile copies nvcc + tooling from the official nvidia/cuda devel
+#   image via multi-stage build — no apt CUDA packages, no full toolkit.
+#
+# Upstream sync: when the upstream Dockerfile changes, update the section
+# marked "UPSTREAM" below to match. The CUDA section should remain stable.
+# See docs/cata/PATCH-002-cookbook-cuda-llamacpp.md for details.
+
+# ===== Stage 1: Official CUDA devel image (source of nvcc + tooling) =====
+# CUDA 13.0 is required because the base image (python:3.14-slim, Debian
+# Trixie) ships GCC 14 + glibc 2.41. CUDA 12.x headers are incompatible
+# with glibc 2.41's noexcept annotations in bits/mathcalls.h. CUDA 13.0
+# is designed for newer toolchains and the host driver is CUDA 13.0.
+FROM nvidia/cuda:13.0.3-devel-ubuntu22.04 AS cuda-toolkit
+
+# ===== Stage 2: Upstream Odysseus image + CUDA tooling =====
+FROM python:3.14-slim
+
+# --- UPSTREAM section (keep in sync with upstream Dockerfile) ---
+# System deps. tmux is required by Cookbook for background downloads/serves.
+# openssh-client is required for Cookbook remote server tests, setup, probes,
+# downloads, and serves from Docker installs.
+# git/cmake are required when Cookbook builds llama.cpp on first llama.cpp
+# launch inside Docker.
+# nodejs/npm provide npx for the optional built-in Browser MCP server.
+# gosu lets the entrypoint drop privileges cleanly so signals still reach
+# uvicorn directly (no extra shell layer like `su`/`sudo` would add).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    curl \
+    git \
+    nodejs \
+    npm \
+    tmux \
+    openssh-client \
+    gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python deps first (layer cache). Optional extras (PyMuPDF AGPL, etc.)
+# are opt-in so the default image stays MIT-core; see requirements-optional.txt.
+ARG INSTALL_OPTIONAL=false
+COPY requirements.txt requirements-optional.txt ./
+RUN pip install --no-cache-dir -r requirements.txt \
+    && if [ "$INSTALL_OPTIONAL" = "true" ]; then pip install --no-cache-dir -r requirements-optional.txt; fi
+
+# Copy app code
+COPY . .
+
+# Create data directory (mount a volume here for persistence)
+RUN mkdir -p data logs services/cache/search
+
+# Entrypoint that drops to PUID/PGID (default 1000:1000) and repairs
+# ownership on the bind-mounted /app/data and /app/logs. Without this,
+# the container runs as root and writes root-owned files into host
+# bind mounts — any later non-root run (or a host user trying to
+# update them) silently fails on EPERM, breaking skill extraction,
+# prefs persistence, mail attachments, etc.
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# --- CUDA section (PATCH-002, Cata-specific) ---
+# Copy CUDA build tooling from the official nvidia/cuda devel image.
+# Targeted copy: only the binaries, headers, NVVM, and runtime libraries
+# needed for CMake to configure GGML_CUDA=ON and for llama.cpp to run.
+COPY --from=cuda-toolkit /usr/local/cuda/bin/ /usr/local/cuda/bin/
+COPY --from=cuda-toolkit /usr/local/cuda/include/ /usr/local/cuda/include/
+COPY --from=cuda-toolkit /usr/local/cuda/nvvm/ /usr/local/cuda/nvvm/
+COPY --from=cuda-toolkit /usr/local/cuda/lib64/libcudart.so* /usr/local/cuda/lib64/
+COPY --from=cuda-toolkit /usr/local/cuda/lib64/libcudart_static.a /usr/local/cuda/lib64/
+COPY --from=cuda-toolkit /usr/local/cuda/lib64/libcudadevrt.a /usr/local/cuda/lib64/
+COPY --from=cuda-toolkit /usr/local/cuda/lib64/libcublas.so* /usr/local/cuda/lib64/
+COPY --from=cuda-toolkit /usr/local/cuda/lib64/libcublasLt.so* /usr/local/cuda/lib64/
+
+# Register CUDA libraries with ldconfig so they're discoverable at runtime
+# without needing LD_LIBRARY_PATH in every subprocess.
+RUN echo "/usr/local/cuda/lib64" > /etc/ld.so.conf.d/cuda.conf && ldconfig
+
+# Make nvcc and CUDA tooling discoverable. CUDA_HOME is checked by CMake's
+# FindCUDAToolkit and by Cookbook's build script. PATH ensures `command -v nvcc`
+# succeeds. LD_LIBRARY_PATH is a fallback for processes that don't use ldconfig.
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=/usr/local/cuda/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+EXPOSE 7000
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7000"]
